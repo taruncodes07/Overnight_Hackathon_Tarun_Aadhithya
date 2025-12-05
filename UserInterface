@@ -1,0 +1,763 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import time
+import uuid
+import re
+import unicodedata
+import pandas as pd
+import difflib # For fuzzy matching
+
+# ==============================================================================
+# 0. CONTENT MODERATION LOGIC (Integrated)
+# ==============================================================================
+
+SIMILARITY_THRESHOLD = 0.80 # 80% similarity threshold for flagging phonetic misspellings
+
+# Load and process the CSV data
+try:
+    # Assumes the CSV file is accessible in the current environment
+    df = pd.read_csv("hindi top 150 swear words .csv", header=None)
+    OFFENSIVE_TERMS = df[0].astype(str).str.lower().str.strip().tolist()
+except FileNotFoundError:
+    print("Warning: CSV file not found. Using a small internal list.")
+    OFFENSIVE_TERMS = ["chutiya", "madarchod", "gand", "lavda", "lode"]
+
+# Add manually verified variants for robust detection of obfuscation
+OFFENSIVE_TERMS.extend(["kute ki aulad", "lavde", "lode", "madarchod", "chutiya"]) 
+UNIQUE_OFFENSIVE_TERMS = list(set(OFFENSIVE_TERMS))
+
+
+# --- Normalization Helpers ---
+
+def normalize_hinglish_slang(text):
+    """Cleans up common Hinglish phonetic substitutions, symbols, and repetitions."""
+    text = text.lower()
+    text = text.replace('!', 'i').replace('@', 'a').replace('$', 's')
+    text = text.replace('0', 'o').replace('3', 'e').replace('5', 's')
+    text = text.replace('7', 't').replace('1', 'l')
+    text = re.sub(r'([a-z])\1{1,}', r'\1', text)
+    return text
+
+def remove_diacritics(text):
+    """Removes accents/diacritics."""
+    normalized_text = unicodedata.normalize('NFD', text)
+    return "".join([c for c in normalized_text if not unicodedata.combining(c)])
+
+def standardize_text(text):
+    """Applies all normalization steps."""
+    text = remove_diacritics(text)
+    text = normalize_hinglish_slang(text)
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    return text.strip()
+
+def get_raw_index_map(raw_input):
+    """Creates a mapping of normalized tokens back to their raw index span."""
+    raw_index_map = []
+    for match in re.finditer(r'\S+', raw_input):
+        token = match.group(0)
+        normalized_token = standardize_text(token)
+        if normalized_token:
+            raw_index_map.append({
+                'norm_token': normalized_token,
+                'raw_start': match.start(),
+                'raw_end': match.end(),
+                'matched': False
+            })
+    return raw_index_map
+
+# --- Redaction Helper ---
+
+def redact_content(content, matches):
+    """Replaces identified offensive substrings in the content with block characters."""
+    if not matches:
+        return content
+        
+    matches.sort(key=lambda x: x[0], reverse=True)
+    
+    redacted_content = list(content)
+    for start, end, _, _ in matches:
+        length = end - start
+        redacted_content[start:end] = ['█'] * length
+        
+    return "".join(redacted_content)
+
+
+# --- Main Filter Function ---
+
+def moderation_filter(raw_input_string):
+    """
+    Scans the input string for offensive words/phrases and returns raw string indices.
+    
+    Returns: (filtered_string, list_of_matches, number_of_matches)
+    """
+    normalized_text = standardize_text(raw_input_string)
+    raw_map = get_raw_index_map(raw_input_string)
+    matches = []
+    
+    sorted_terms = sorted(UNIQUE_OFFENSIVE_TERMS, key=len, reverse=True)
+
+    # 1. Exact Match (Token-based)
+    for term in sorted_terms:
+        # Only check single words or terms exactly matching a token
+        if len(term.split()) == 1: 
+            for entry in raw_map:
+                if entry['norm_token'] == term and not entry['matched']:
+                    matches.append((entry['raw_start'], entry['raw_end'], term, "Exact"))
+                    entry['matched'] = True 
+
+    # 2. Fuzzy Match (Fallback on remaining unmatched tokens)
+    for entry in raw_map:
+        if entry['matched']: continue
+            
+        input_word = entry['norm_token']
+        if len(input_word) < 3: continue
+
+        for term in UNIQUE_OFFENSIVE_TERMS:
+            if len(term.split()) == 1:
+                ratio = difflib.SequenceMatcher(None, input_word, term).ratio()
+                
+                if ratio >= SIMILARITY_THRESHOLD and ratio < 1.0:
+                    matches.append((
+                        entry['raw_start'],
+                        entry['raw_end'],
+                        term, 
+                        f"Fuzzy ({ratio*100:.2f}%)"
+                    ))
+                    entry['matched'] = True
+                    break 
+    
+    # Remove duplicates
+    unique_matches = list(set(matches))
+
+    return normalized_text, unique_matches, len(unique_matches)
+
+
+# ==============================================================================
+# 1. Styling Variables (DARK THEME)
+# ==============================================================================
+BG_COLOR = "#1f2937"# Dark slate grey/blue (App Background)
+POST_BG_COLOR = "#2d3748"# Slightly lighter dark grey (Post Cards)
+ACCENT_COLOR = "#4299e1"# Brighter, modern blue
+LIKE_COLOR_ACTIVE = "#f56565" # Muted red/pink for likes
+TEXT_COLOR = "#f7fafc" # Near-white text
+SECONDARY_TEXT_COLOR = "#a0aec0" # Light grey for timestamps/secondary info
+FONT_PRIMARY = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 11, "bold")
+FONT_TITLE = ("Segoe UI", 16, "bold")
+
+# ==============================================================================
+# 2. Data Storage and Initialization
+# ==============================================================================
+
+# In-memory storage structures
+USERS = {}
+POSTS = {}
+REPORTS = {} # Global list of outstanding reports
+
+# Global state variables
+ACTIVE_USER_ID = None
+ADMIN_ID = "adm-000"
+root = None 
+canvas = None 
+inner_frame = None 
+active_user_label = None 
+
+def generate_id(prefix):
+    """Generates a unique ID with a specified prefix."""
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+def get_timestamp():
+    """Returns a formatted timestamp."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def get_username(user_id):
+    """Retrieves the username for a given user_id."""
+    user = USERS.get(user_id)
+    return user['username'] if user else "Unknown User"
+
+def find_post_by_id(post_id):
+    """Retrieves a post dictionary by its ID."""
+    return POSTS.get(post_id)
+
+def find_comment_by_id(post_id, comment_id):
+    """Retrieves a comment dictionary by its ID from a specific post."""
+    post = find_post_by_id(post_id)
+    if not post:
+        return None
+    for comment in post['comments']:
+        if comment['comment_id'] == comment_id:
+            return comment
+    return None
+
+# --- INITIALIZATION HELPER FUNCTIONS ---
+
+def create_post_initial(author_id, content):
+    """Creates a post, running content through moderation filter for redaction."""
+    filtered_text, matches, count = moderation_filter(content) # Run filter
+    
+    post_id = generate_id("pst")
+    new_post = {
+        "post_id": post_id,
+        "author_id": author_id,
+        "raw_content": content,
+        "content": redact_content(content, matches), # Store REDACTED content for display
+        "is_flagged": count > 0,
+        "timestamp": get_timestamp(),
+        "comments": [],
+        "likes": set(),
+        "mod_matches": matches
+    }
+    POSTS[post_id] = new_post
+    return post_id
+
+def add_comment_initial(post_id, author_id, content):
+    """Adds a comment, running content through moderation filter for redaction."""
+    post = POSTS.get(post_id)
+    if not post: return
+
+    filtered_text, matches, count = moderation_filter(content) # Run filter
+
+    comment_id = generate_id("cmt")
+    new_comment = {
+        "comment_id": comment_id,
+        "author_id": author_id,
+        "raw_content": content,
+        "content": redact_content(content, matches), # Store REDACTED content for display
+        "is_flagged": count > 0,
+        "timestamp": get_timestamp(),
+        "reports": [],
+        "mod_matches": matches # Store matches for Admin review
+    }
+    post['comments'].append(new_comment)
+    return comment_id
+
+def report_initial(post_id, comment_id, reporter_id, reason):
+    """Reports a comment."""
+    comment = find_comment_by_id(post_id, comment_id)
+    if not comment: return
+    
+    report_id = generate_id("rpt")
+    new_report = {
+        "report_id": report_id,
+        "reporter_id": reporter_id,
+        "reason": reason,
+        "timestamp": get_timestamp(),
+        "post_id": post_id,
+        "comment_id": comment_id
+    }
+    REPORTS[report_id] = new_report
+    comment['reports'].append(new_report)
+    return report_id
+
+def init_data():
+    """Initializes predefined users and sets up data structures."""
+    global USERS, ACTIVE_USER_ID, ADMIN_ID
+
+    # ALICE IS NOW THE ADMIN USER (user with ADMIN_ID)
+    USERS[ADMIN_ID] = {"user_id": ADMIN_ID, "username": "Alice"} 
+    USERS["usr-102"] = {"user_id": "usr-102", "username": "Bob"}
+    USERS["usr-103"] = {"user_id": "usr-103", "username": "Charlie"}
+    
+    ACTIVE_USER_ID = ADMIN_ID # Alice is the default active user
+
+# ==============================================================================
+# 3. Post and Comment Creation (GUI Functions)
+# ==============================================================================
+
+def create_post_submit(post_window, content_entry):
+    """Handles the actual submission from the Toplevel window."""
+    content = content_entry.get("1.0", tk.END).strip()
+    
+    if not content:
+        messagebox.showerror("Error", "Post content cannot be empty!", parent=post_window)
+        return
+
+    create_post_initial(ACTIVE_USER_ID, content)
+    post_window.destroy()
+    
+    refresh_feed_ui()
+    
+def open_post_editor():
+    """Opens a Toplevel window to accept new post input."""
+    if not root: return
+    
+    post_message = tk.Toplevel(root)
+    post_message.title("Create New Post")
+    post_message.geometry("450x300")
+    post_message.config(bg=POST_BG_COLOR)
+    
+    tk.Label(post_message, text="What's on your mind?", font=FONT_BOLD, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
+    
+    content_entry = tk.Text(post_message, height=8, width=50, font=FONT_PRIMARY, bd=1, relief=tk.SOLID, bg=BG_COLOR, fg=TEXT_COLOR)
+    content_entry.pack(pady=5, padx=15, fill="x", expand=True)
+    
+    submit_btn = tk.Button(post_message, 
+                            text="Post Now", 
+                            command=lambda: create_post_submit(post_message, content_entry),
+                            bg=ACCENT_COLOR, fg=TEXT_COLOR, font=FONT_BOLD, relief=tk.FLAT)
+    submit_btn.pack(pady=10)
+
+def add_comment_submit(post_id, content_entry):
+    """Handles submission of a new comment."""
+    content = content_entry.get().strip()
+    
+    if not content or content == "Add a comment...":
+        messagebox.showwarning("Warning", "Comment cannot be empty!")
+        return
+        
+    add_comment_initial(post_id, ACTIVE_USER_ID, content)
+    content_entry.delete(0, tk.END) # Clear entry
+    
+    refresh_feed_ui()
+
+def report_comment_submit(report_window, post_id, comment_id, reason_entry):
+    """Handles submission of a comment report."""
+    reason = reason_entry.get().strip()
+    
+    if not reason:
+        messagebox.showerror("Error", "Reason is required.", parent=report_window)
+        return
+        
+    report_initial(post_id, comment_id, ACTIVE_USER_ID, reason)
+    report_window.destroy()
+    messagebox.showinfo("Success", "Comment reported successfully!")
+
+def open_report_window(post_id, comment_id):
+    """Opens a modal window to report a specific comment."""
+    if not root: return
+    
+    report_message = tk.Toplevel(root)
+    report_message.title("Report Comment")
+    report_message.geometry("350x200")
+    report_message.config(bg=POST_BG_COLOR)
+    
+    comment = find_comment_by_id(post_id, comment_id)
+    if not comment:
+        report_message.destroy()
+        messagebox.showerror("Error", "Comment not found.")
+        return
+
+    tk.Label(report_message, text=f"Reporting Comment: {comment_id}", font=FONT_BOLD, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
+    # Use raw_content for admin/reporting context, if available
+    content_display = comment.get('raw_content', comment['content'])
+    tk.Label(report_message, text=f"Content: '{content_display[:30]}...'", font=FONT_PRIMARY, bg=POST_BG_COLOR, fg=SECONDARY_TEXT_COLOR, wraplength=300).pack()
+
+    tk.Label(report_message, text="Reason:", font=FONT_PRIMARY, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=(10, 0))
+    reason_entry = tk.Entry(report_message, width=40, font=FONT_PRIMARY, bd=1, relief=tk.SOLID, bg=BG_COLOR, fg=TEXT_COLOR)
+    reason_entry.pack(pady=5)
+
+    submit_btn = tk.Button(report_message, 
+                            text="Submit Report", 
+                            command=lambda: report_comment_submit(report_message, post_id, comment_id, reason_entry),
+                            bg=LIKE_COLOR_ACTIVE, fg=TEXT_COLOR, font=FONT_BOLD, relief=tk.FLAT)
+    submit_btn.pack(pady=10)
+    
+def toggle_like(post_id):
+    """Adds or removes the active user's ID from the post's 'likes' set."""
+    post = POSTS.get(post_id)
+    if not post: return
+
+    if ACTIVE_USER_ID in post['likes']:
+        post['likes'].remove(ACTIVE_USER_ID)
+    else:
+        post['likes'].add(ACTIVE_USER_ID)
+    
+    refresh_feed_ui()
+
+# ==============================================================================
+# 4. GUI Rendering Functions
+# ==============================================================================
+
+def clear_frame(frame):
+    """Destroys all widgets in a frame."""
+    for widget in frame.winfo_children():
+        widget.destroy()
+
+def create_post_widget(parent_frame, post):
+    """Renders a single post and its comments."""
+    post_id = post['post_id']
+    
+    post_frame = tk.Frame(parent_frame, bg=POST_BG_COLOR, padx=15, pady=15, 
+                            relief=tk.FLAT, borderwidth=1, highlightbackground="#4a5568", highlightthickness=1)
+    
+    post_frame.pack(fill="x", pady=(10, 0))
+
+    # --- Header (Author and Time) ---
+    header_frame = tk.Frame(post_frame, bg=POST_BG_COLOR)
+    header_frame.pack(fill="x", pady=(0, 5))
+    tk.Label(header_frame, text=f"@{get_username(post['author_id'])}", font=FONT_BOLD, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(side=tk.LEFT)
+    tk.Label(header_frame, text=post['timestamp'], font=FONT_PRIMARY, bg=POST_BG_COLOR, fg=SECONDARY_TEXT_COLOR).pack(side=tk.RIGHT)
+
+    # --- Content (Redacted content is displayed here) ---
+    content_display = post['content']
+    if post.get('is_flagged'):
+        content_display = "⚠️ [AUTO-REDACTED] " + content_display
+    
+    tk.Label(post_frame, text=content_display, font=FONT_PRIMARY, bg=POST_BG_COLOR, fg=TEXT_COLOR, wraplength=450, justify=tk.LEFT).pack(fill="x", pady=(5, 10))
+
+    # --- Actions (Action Bar) ---
+    action_frame = tk.Frame(post_frame, bg=POST_BG_COLOR)
+    action_frame.pack(fill="x", pady=(5, 5))
+    
+    # 1. Like Button
+    is_liked = ACTIVE_USER_ID in post['likes']
+    like_count = len(post['likes'])
+    
+    like_btn_text = "❤ Liked" if is_liked else "🤍 Like"
+    like_btn_fg = LIKE_COLOR_ACTIVE if is_liked else SECONDARY_TEXT_COLOR
+    
+    like_btn = tk.Button(action_frame, text=like_btn_text, font=FONT_BOLD, 
+                            fg=like_btn_fg, bg=POST_BG_COLOR, relief=tk.FLAT, 
+                            command=lambda p=post_id: toggle_like(p))
+    like_btn.pack(side=tk.LEFT, padx=(0, 10))
+    
+    # 2. Like Count Label
+    tk.Label(action_frame, text=f"{like_count} Likes", font=FONT_PRIMARY, 
+                bg=POST_BG_COLOR, fg=SECONDARY_TEXT_COLOR).pack(side=tk.LEFT)
+    
+    # --- Comments Section ---
+    tk.Label(post_frame, text=f"Comments ({len(post['comments'])})", font=FONT_BOLD, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(fill="x", pady=(10, 5))
+    
+    comments_frame = tk.Frame(post_frame, bg=BG_COLOR, padx=5, pady=5)
+    comments_frame.pack(fill="x")
+    
+    for comment in post['comments']:
+        comment_frame = tk.Frame(comments_frame, bg=BG_COLOR)
+        comment_frame.pack(fill="x", pady=(2, 2))
+        
+        report_count = len(comment['reports'])
+        report_status = f" (Reported: {report_count})" if report_count > 0 else ""
+        
+        # Add automated moderation status
+        if comment.get('is_flagged'):
+            report_status += " [FLAGGED]"
+            
+        # Comment Header
+        tk.Label(comment_frame, text=f"@{get_username(comment['author_id'])}:", font=FONT_BOLD, bg=BG_COLOR, fg=TEXT_COLOR).pack(side=tk.LEFT)
+        
+        # Comment Content (Redacted content is displayed here)
+        tk.Label(comment_frame, text=f"{comment['content']}{report_status}", font=FONT_PRIMARY, bg=BG_COLOR, fg=SECONDARY_TEXT_COLOR, wraplength=300, justify=tk.LEFT).pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+        
+        # Report Button
+        report_btn = tk.Button(comment_frame, text="Report", font=('Segoe UI', 8), bg=BG_COLOR, fg=SECONDARY_TEXT_COLOR, activebackground=POST_BG_COLOR, relief=tk.FLAT, 
+                                command=lambda p=post_id, c=comment['comment_id']: open_report_window(p, c))
+        report_btn.pack(side=tk.RIGHT)
+
+    # --- New Comment Input ---
+    comment_input_frame = tk.Frame(post_frame, bg=POST_BG_COLOR, pady=5)
+    comment_input_frame.pack(fill="x")
+    
+    comment_entry = tk.Entry(comment_input_frame, font=FONT_PRIMARY, bd=1, relief=tk.SOLID, bg=BG_COLOR, fg=TEXT_COLOR)
+    comment_entry.insert(0, "Add a comment...")
+    comment_entry.bind("<FocusIn>", lambda event: comment_entry.delete(0, tk.END) if comment_entry.get() == "Add a comment..." else None)
+    comment_entry.bind("<FocusOut>", lambda event: comment_entry.insert(0, "Add a comment...") if not comment_entry.get() else None)
+    comment_entry.pack(side=tk.LEFT, fill="x", expand=True, ipady=5)
+    
+    send_btn = tk.Button(comment_input_frame, text="Send", font=FONT_BOLD, bg=ACCENT_COLOR, fg=TEXT_COLOR, relief=tk.FLAT, 
+                            command=lambda p=post_id, e=comment_entry: add_comment_submit(p, e))
+    send_btn.pack(side=tk.RIGHT, padx=(5, 0))
+
+def refresh_feed_ui():
+    """Clears the inner frame and re-renders all posts."""
+    global ACTIVE_USER_ID
+
+    if not inner_frame: return # Safety check
+
+    clear_frame(inner_frame)
+    
+    # Sort posts by timestamp (newest first)
+    sorted_posts = sorted(POSTS.values(), key=lambda p: p['timestamp'], reverse=True)
+    
+    # Update active user label
+    active_user_label.config(text=f"Active User: @{get_username(ACTIVE_USER_ID)}")
+
+    for post in sorted_posts:
+        create_post_widget(inner_frame, post)
+
+    # Update scroll region after all widgets are packed
+    inner_frame.update_idletasks()
+    canvas.config(scrollregion=canvas.bbox("all"))
+
+# ==============================================================================
+# 5. User Management and Admin Console (GUI Windows)
+# ==============================================================================
+
+def switch_user_gui():
+    """Opens a modal window for switching the active user."""
+    if not root: return
+    
+    switch_win = tk.Toplevel(root)
+    switch_win.title("Switch User")
+    switch_win.geometry("300x250")
+    switch_win.config(bg=POST_BG_COLOR)
+    
+    tk.Label(switch_win, text="Select New Active User", font=FONT_BOLD, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
+
+    user_var = tk.StringVar(switch_win)
+    
+    # Include all users, including the admin ID (Alice) for selection
+    user_options = {uid: u['username'] for uid, u in USERS.items()} 
+    
+    if user_options:
+        # Set default to the current active user, or the first available user
+        if ACTIVE_USER_ID in user_options:
+             user_var.set(ACTIVE_USER_ID)
+        else:
+             user_var.set(list(user_options.keys())[0]) 
+
+        user_menu = ttk.Combobox(switch_win, textvariable=user_var, values=list(user_options.keys()), state="readonly")
+        user_menu.pack(pady=10)
+        
+        def commit_switch():
+            global ACTIVE_USER_ID
+            new_uid = user_var.get()
+            ACTIVE_USER_ID = new_uid
+            switch_win.destroy()
+            refresh_feed_ui()
+        
+        tk.Button(switch_win, text="Switch", command=commit_switch, bg=ACCENT_COLOR, fg=TEXT_COLOR, font=FONT_BOLD).pack(pady=10)
+    else:
+        tk.Label(switch_win, text="No users available.", bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=20)
+
+
+def open_admin_console():
+    """Opens the admin panel for managing reports and viewing raw content."""
+    if ACTIVE_USER_ID != ADMIN_ID:
+        # Ensure the label uses the correct username for feedback
+        admin_username = get_username(ADMIN_ID)
+        messagebox.showerror("Access Denied", f"Only the Admin user (@{admin_username}) can access this console.")
+        return
+        
+    if not root: return
+
+    admin_win = tk.Toplevel(root)
+    admin_win.title("Admin Console: Manage Reports & Flags")
+    admin_win.geometry("900x450") # Increased size for better raw content viewing
+    admin_win.config(bg=POST_BG_COLOR)
+    
+    tk.Label(admin_win, text="Outstanding Reports & Flags", font=FONT_TITLE, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
+
+    # --- Data Aggregation ---
+    review_items = []
+    
+    # 1. Aggregate User Reports
+    reported_comment_ids = set()
+    for report_id, report in REPORTS.items():
+        comment = find_comment_by_id(report['post_id'], report['comment_id'])
+        if comment:
+            review_items.append({
+                'id': report_id,
+                'type': 'User Report',
+                'raw_content': comment.get('raw_content', comment['content']), # Use raw_content
+                'reason': report['reason'],
+                'reporter': get_username(report['reporter_id']),
+                'comment_id': comment['comment_id'],
+                'post_id': report['post_id'],
+                'mod_matches': comment.get('mod_matches', [])
+            })
+            reported_comment_ids.add(comment['comment_id'])
+            
+    # 2. Aggregate Automated Flags (that haven't been user-reported)
+    for post in POSTS.values():
+        for comment in post['comments']:
+            if comment.get('is_flagged') and comment['comment_id'] not in reported_comment_ids:
+                 review_items.append({
+                    'id': f"AUTO-{comment['comment_id']}",
+                    'type': 'Auto-Flag',
+                    'raw_content': comment.get('raw_content', comment['content']), # Use raw_content
+                    'reason': 'System Flag',
+                    'reporter': 'System',
+                    'comment_id': comment['comment_id'],
+                    'post_id': post['post_id'],
+                    'mod_matches': comment.get('mod_matches', [])
+                })
+
+
+    if not review_items:
+        tk.Label(admin_win, text="No outstanding items to review.", bg=POST_BG_COLOR, fg=SECONDARY_TEXT_COLOR, font=FONT_BOLD).pack(pady=50)
+        return
+
+    # --- Treeview Setup ---
+    style = ttk.Style()
+    style.theme_use('default')
+    style.configure("Treeview", background=POST_BG_COLOR, foreground=TEXT_COLOR, fieldbackground=POST_BG_COLOR)
+    style.map('Treeview', background=[('selected', ACCENT_COLOR)])
+    style.configure("Treeview.Heading", background=BG_COLOR, foreground=TEXT_COLOR)
+
+    tree = ttk.Treeview(admin_win, columns=('CommentID', 'Type', 'Comment', 'Reason', 'Matches'), show='headings')
+    tree.heading('CommentID', text='Comment ID', anchor=tk.W)
+    tree.heading('Type', text='Type', anchor=tk.W)
+    tree.heading('Comment', text='RAW Content (Non-Redacted)', anchor=tk.W) # Title updated
+    tree.heading('Reason', text='Reason/Reporter', anchor=tk.W)
+    tree.heading('Matches', text='Mod Matches', anchor=tk.W)
+    tree.column('CommentID', width=120)
+    tree.column('Type', width=90)
+    tree.column('Comment', width=450) # Increased size for full raw content
+    tree.column('Reason', width=150)
+    tree.column('Matches', width=80)
+    tree.pack(fill="both", expand=True, padx=10)
+
+    for item in review_items:
+        match_details = f"{len(item['mod_matches'])} hits"
+        
+        # Display the FULL RAW content (Key change: displays non-redacted content)
+        content_display = item['raw_content'] 
+        
+        tree.insert('', tk.END, iid=item['comment_id'], values=(
+            item['comment_id'], 
+            item['type'], 
+            content_display, 
+            item['reason'] if item['type'] == 'User Report' else 'System Flag',
+            match_details
+        ))
+
+    # --- Admin Action Logic ---
+    def handle_admin_action(action):
+        selected_id = tree.focus()
+        if not selected_id:
+            messagebox.showwarning("Selection Error", "Please select an item first.")
+            return
+
+        selected_comment_id = selected_id 
+        
+        if action == 'delete':
+            admin_delete_reported_comment_logic(selected_comment_id)
+        elif action == 'resolve':
+            admin_mark_report_resolved_logic(selected_comment_id)
+
+        # For delete/resolve, refresh the feed and console
+        if action in ('delete', 'resolve'):
+            admin_win.destroy() 
+            open_admin_console()
+            refresh_feed_ui()
+
+    # Admin Action Buttons
+    button_frame = tk.Frame(admin_win, bg=POST_BG_COLOR)
+    button_frame.pack(pady=10)
+    
+    # Removed "View Details" button
+    
+    tk.Button(button_frame, text="Delete Comment", bg=LIKE_COLOR_ACTIVE, fg=TEXT_COLOR, font=FONT_BOLD, 
+                command=lambda: handle_admin_action('delete')).pack(side=tk.LEFT, padx=5)
+    
+    tk.Button(button_frame, text="Mark Resolved (Ignore)", bg=ACCENT_COLOR, fg=TEXT_COLOR, font=FONT_BOLD, 
+                command=lambda: handle_admin_action('resolve')).pack(side=tk.LEFT, padx=5)
+
+# --- Admin Logic Helpers ---
+def admin_mark_report_resolved_logic(comment_id):
+    """Deletes reports associated with a comment and clears auto-flag."""
+    
+    # 1. Clear auto-flag status from comment object
+    for post in POSTS.values():
+        for comment in post['comments']:
+            if comment['comment_id'] == comment_id:
+                comment['is_flagged'] = False
+                comment['mod_matches'] = [] # Clear stored matches
+                break
+    
+    # 2. Remove all related reports from the global list
+    reports_to_delete = [rid for rid, r in REPORTS.items() if r['comment_id'] == comment_id]
+    for rid in reports_to_delete:
+        if rid in REPORTS:
+            del REPORTS[rid]
+            
+    messagebox.showinfo("Success", f"Comment {comment_id} status resolved.")
+
+
+def admin_delete_reported_comment_logic(comment_id):
+    """Deletes the comment and all associated reports/flags."""
+    
+    found = False
+    for post in POSTS.values():
+        for comment in post['comments']:
+            if comment['comment_id'] == comment_id:
+                post['comments'].remove(comment)
+                found = True
+                break
+        if found: break
+
+    if not found:
+        messagebox.showwarning("Warning", "Associated comment not found/already deleted. Cleaning up reports.")
+    
+    # Remove all related reports from the global list
+    reports_to_delete = [rid for rid, r in REPORTS.items() if r['comment_id'] == comment_id]
+    for rid in reports_to_delete:
+        if rid in REPORTS:
+            del REPORTS[rid]
+        
+    messagebox.showinfo("Success", f"Comment {comment_id} deleted and flags resolved.")
+
+
+# ==============================================================================
+# 6. Main Program Entry Point
+# ==============================================================================
+
+if __name__ == "__main__":
+    init_data()
+    
+    # Setup initial demonstration data
+    pst_id_a = create_post_initial("adm-000", "Hello world! Starting my journey on this platform. This is a longer post to test scrolling and wrapping features. #firstpost")
+    pst_id_b = create_post_initial("usr-102", "Reading a great book today. Any recommendations? Let me know in the comments below! 📚")
+    # This post contains a hidden swear word to test post redaction
+    pst_id_c = create_post_initial("usr-103", "Quick update: The coffee machine is finally fixed! I think that guy is a chutiya.") 
+    
+    # Pre-set some likes for demonstration
+    POSTS[pst_id_a]['likes'].add("usr-102")
+    POSTS[pst_id_a]['likes'].add("usr-103")
+    POSTS[pst_id_c]['likes'].add("adm-000")
+    
+    # Normal comment
+    add_comment_initial(pst_id_a, "usr-102", "Welcome! Nice content.")
+    
+    # Flagged comment (should be auto-redacted and flagged)
+    cmt_id_2 = add_comment_initial(pst_id_a, "usr-103", "This is spam and offensive, you are a lawde!") 
+    
+    # User-reported comment (should be auto-redacted and user-reported)
+    cmt_id_3 = add_comment_initial(pst_id_b, "adm-000", "Try 'The Martian'. Excellent read. You are a madrchod.") 
+
+    # Add a report to cmt_id_3 (Bob reports Alice's comment)
+    report_initial(pst_id_b, cmt_id_3, "usr-102", "Violates community guidelines: hate speech.")
+    
+    # --- GUI Setup ---
+    root = tk.Tk()
+    root.title("Social Feed Simulation (Moderation Integrated)")
+    root.geometry("550x750")
+    root.config(bg=BG_COLOR)
+    
+    # Configure overall theme (especially for unstyled elements like menu bar)
+    style = ttk.Style()
+    style.theme_use('clam') # 'clam' theme often allows for better customization
+    style.configure(".", font=FONT_PRIMARY, background=BG_COLOR, foreground=TEXT_COLOR)
+
+    # --- Header Frame (Fixed at Top) ---
+    header_frame = tk.Frame(root, bg=POST_BG_COLOR, padx=15, pady=10, relief=tk.RAISED, bd=0, highlightbackground="#4a5568", highlightthickness=1)
+    header_frame.pack(fill="x", side=tk.TOP)
+
+    tk.Label(header_frame, text="Social Feed", font=FONT_TITLE, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(side=tk.LEFT)
+
+    # Active User Label 
+    active_user_label = tk.Label(header_frame, text=f"Active User: @{get_username(ACTIVE_USER_ID)}", font=FONT_BOLD, bg=POST_BG_COLOR, fg=ACCENT_COLOR)
+    active_user_label.pack(side=tk.LEFT, padx=20)
+    
+    # Action Buttons
+    tk.Button(header_frame, text="Switch User", command=switch_user_gui, bg=BG_COLOR, fg=TEXT_COLOR, activebackground=POST_BG_COLOR, font=FONT_BOLD).pack(side=tk.LEFT, padx=5)
+    tk.Button(header_frame, text="Admin", command=open_admin_console, bg=BG_COLOR, fg=TEXT_COLOR, activebackground=POST_BG_COLOR, font=FONT_BOLD).pack(side=tk.LEFT, padx=5)
+    tk.Button(header_frame, text="Post ✍", command=open_post_editor, bg=ACCENT_COLOR, fg=TEXT_COLOR, font=FONT_BOLD, relief=tk.FLAT).pack(side=tk.RIGHT) 
+
+    # --- Scrollable Area Setup ---
+    canvas = tk.Canvas(root, bg=BG_COLOR, highlightthickness=0)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+    scrollbar.pack(side=tk.RIGHT, fill="y")
+
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+    inner_frame = tk.Frame(canvas, bg=BG_COLOR, padx=10)
+    canvas.create_window((0, 0), window=inner_frame, anchor="nw", width=530)
+
+    # Initial rendering of the feed
+    refresh_feed_ui()
+
+    root.mainloop()

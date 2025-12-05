@@ -5,17 +5,36 @@ import uuid
 import re
 import unicodedata
 import pandas as pd
-import difflib # For fuzzy matching
+import difflib 
 
 # ==============================================================================
-# 0. CONTENT MODERATION LOGIC (Integrated)
+# 0. CONTENT MODERATION LOGIC (Integrated with Safe-Word Filter)
 # ==============================================================================
 
-SIMILARITY_THRESHOLD = 0.80 # 80% similarity threshold for flagging phonetic misspellings
+SIMILARITY_THRESHOLD = 0.80 # 80% similarity threshold
+
+# --- NEW: Safe English Word List ---
+# Using a sample of the top 10,000 most common English words.
+# A small, representative list is used here for portability. In a real system, 
+# this would be loaded from a larger corpus.
+SAFE_ENGLISH_WORDS = {
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", 
+    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at", 
+    "this", "but", "his", "by", "from", "they", "we", "say", "her", "she", 
+    "or", "an", "will", "my", "one", "all", "would", "there", "their", "what", 
+    "so", "up", "out", "if", "about", "who", "get", "which", "go", "me", 
+    "when", "make", "can", "like", "time", "no", "just", "him", "know", "take", 
+    "people", "into", "year", "your", "good", "some", "could", "see", "other", 
+    "than", "then", "now", "look", "only", "come", "its", "over", "think", "also", 
+    "back", "after", "use", "two", "how", "our", "work", "first", "well", "way",
+    "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
+    "is", "was", "are", "been", "wasn", "were", "where", "them", "had", "been",
+    "wasnt", "were", "bug", "cool", "shit", "fuck", "damn", "ass", "idiot" # Example words that might be in a bad word list
+} 
+
 
 # Load and process the CSV data
 try:
-    # Assumes the CSV file is accessible in the current environment
     df = pd.read_csv("hindi top 150 swear words .csv", header=None)
     OFFENSIVE_TERMS = df[0].astype(str).str.lower().str.strip().tolist()
 except FileNotFoundError:
@@ -27,28 +46,47 @@ OFFENSIVE_TERMS.extend(["kute ki aulad", "lavde", "lode", "madarchod", "chutiya"
 UNIQUE_OFFENSIVE_TERMS = list(set(OFFENSIVE_TERMS))
 
 
-# --- Normalization Helpers ---
+# --- Normalization Helpers (Unchanged) ---
+HOMOGLYPH_MAP = {
+    '0': 'o', '1': 'i', '2': 'z', '3': 'e', '4': 'a', '5': 's', '6': 'g',
+    '7': 't', '8': 'b', '9': 'g', '@': 'a', '$': 's', '!': 'i', '|': 'i',
+}
 
-def normalize_hinglish_slang(text):
-    """Cleans up common Hinglish phonetic substitutions, symbols, and repetitions."""
-    text = text.lower()
-    text = text.replace('!', 'i').replace('@', 'a').replace('$', 's')
-    text = text.replace('0', 'o').replace('3', 'e').replace('5', 's')
-    text = text.replace('7', 't').replace('1', 'l')
-    text = re.sub(r'([a-z])\1{1,}', r'\1', text)
-    return text
+def normalize_unicode_text(text: str) -> str:
+    """Unicode NFKC + remove diacritics."""
+    t = unicodedata.normalize('NFKC', text)
+    t = unicodedata.normalize('NFD', t)
+    t = ''.join(ch for ch in t if unicodedata.category(ch) != 'Mn')
+    return t
 
-def remove_diacritics(text):
-    """Removes accents/diacritics."""
-    normalized_text = unicodedata.normalize('NFD', text)
-    return "".join([c for c in normalized_text if not unicodedata.combining(c)])
+def replace_homoglyphs(text: str) -> str:
+    """Replaces Leetspeak/symbols."""
+    return ''.join(HOMOGLYPH_MAP.get(ch, ch) for ch in text)
+
+def join_spaced_letters(text: str) -> str:
+    """Joins sequences like "m a d a r c h o d" -> "madarchod"."""
+    def joiner(m):
+        return ''.join(m.group(0).split())
+    return re.sub(r'(?:\b[a-zA-Z]\b\s*){2,}', joiner, text)
+
+def reduce_repeated_chars(word: str, max_rep: int = 2) -> str:
+    """Reduces sequences like "soooo" -> "soo"."""
+    return re.sub(r'(.)\1{' + str(max_rep) + ',}', lambda m: m.group(1) * max_rep, word)
+
+def strip_symbols_and_whitespace(text: str) -> str:
+    """Strips remaining symbols and collapses whitespace."""
+    t = re.sub(r"[^\w\s]", " ", text) # Replace non-word/non-space symbols with space
+    return re.sub(r"\s+", " ", t).strip()
 
 def standardize_text(text):
-    """Applies all normalization steps."""
-    text = remove_diacritics(text)
-    text = normalize_hinglish_slang(text)
-    text = re.sub(r'[^a-z0-9\s]', '', text)
-    return text.strip()
+    """Applies the sequence of advanced normalization steps."""
+    t = normalize_unicode_text(text)
+    t = t.lower() # Initial lowercasing
+    t = replace_homoglyphs(t)
+    t = join_spaced_letters(t)
+    t = strip_symbols_and_whitespace(t)
+    t = reduce_repeated_chars(t)
+    return t
 
 def get_raw_index_map(raw_input):
     """Creates a mapping of normalized tokens back to their raw index span."""
@@ -65,14 +103,11 @@ def get_raw_index_map(raw_input):
             })
     return raw_index_map
 
-# --- Redaction Helper ---
-
 def redact_content(content, matches):
     """Replaces identified offensive substrings in the content with block characters."""
     if not matches:
         return content
         
-    # Sort matches by start index descending to avoid index shifting problems during redaction
     matches.sort(key=lambda x: x[0], reverse=True)
     
     redacted_content = list(content)
@@ -83,11 +118,11 @@ def redact_content(content, matches):
     return "".join(redacted_content)
 
 
-# --- Main Filter Function ---
+# --- Main Filter Function (MODIFIED) ---
 
 def moderation_filter(raw_input_string):
     """
-    Scans the input string for offensive words/phrases and returns raw string indices.
+    Scans the input string for offensive words/phrases, skipping common English words.
     
     Returns: (filtered_string, list_of_matches, number_of_matches)
     """
@@ -99,10 +134,16 @@ def moderation_filter(raw_input_string):
 
     # 1. Exact Match (Token-based)
     for term in sorted_terms:
-        # Only check single words or terms exactly matching a token
         if len(term.split()) == 1: 
             for entry in raw_map:
-                if entry['norm_token'] == term and not entry['matched']:
+                norm_token = entry['norm_token']
+                
+                # --- NEW SAFE WORD CHECK ---
+                if norm_token in SAFE_ENGLISH_WORDS:
+                    continue 
+                # ---------------------------
+
+                if norm_token == term and not entry['matched']:
                     matches.append((entry['raw_start'], entry['raw_end'], term, "Exact"))
                     entry['matched'] = True 
 
@@ -112,6 +153,11 @@ def moderation_filter(raw_input_string):
             
         input_word = entry['norm_token']
         if len(input_word) < 3: continue
+        
+        # --- NEW SAFE WORD CHECK ---
+        if input_word in SAFE_ENGLISH_WORDS:
+            continue
+        # ---------------------------
 
         for term in UNIQUE_OFFENSIVE_TERMS:
             if len(term.split()) == 1:
@@ -136,9 +182,9 @@ def moderation_filter(raw_input_string):
 # ==============================================================================
 # 1. Styling Variables (DARK THEME)
 # ==============================================================================
-BG_COLOR = "#1f2937"# Dark slate grey/blue (App Background)
-POST_BG_COLOR = "#2d3748"# Slightly lighter dark grey (Post Cards)
-ACCENT_COLOR = "#4299e1"# Brighter, modern blue
+BG_COLOR = "#1f2937" # Dark slate grey/blue (App Background)
+POST_BG_COLOR = "#2d3748" # Slightly lighter dark grey (Post Cards)
+ACCENT_COLOR = "#4299e1" # Brighter, modern blue
 LIKE_COLOR_ACTIVE = "#f56565" # Muted red/pink for likes
 TEXT_COLOR = "#f7fafc" # Near-white text
 SECONDARY_TEXT_COLOR = "#a0aec0" # Light grey for timestamps/secondary info
@@ -252,14 +298,14 @@ def report_initial(post_id, comment_id, reporter_id, reason):
 
 def init_data():
     """Initializes predefined users and sets up data structures."""
-    global USERS, ACTIVE_USER_ID
+    global USERS, ACTIVE_USER_ID, ADMIN_ID
 
-    USERS[ADMIN_ID] = {"user_id": ADMIN_ID, "username": "AdminUser"}
-    USERS["usr-101"] = {"user_id": "usr-101", "username": "Alice"}
+    # ALICE is now the ADMIN USER
+    USERS[ADMIN_ID] = {"user_id": ADMIN_ID, "username": "Alice"} 
     USERS["usr-102"] = {"user_id": "usr-102", "username": "Bob"}
     USERS["usr-103"] = {"user_id": "usr-103", "username": "Charlie"}
     
-    ACTIVE_USER_ID = "usr-101"
+    ACTIVE_USER_ID = ADMIN_ID # Alice is the default active user
 
 # ==============================================================================
 # 3. Post and Comment Creation (GUI Functions)
@@ -495,12 +541,17 @@ def switch_user_gui():
     tk.Label(switch_win, text="Select New Active User", font=FONT_BOLD, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
 
     user_var = tk.StringVar(switch_win)
-    user_options = {uid: u['username'] for uid, u in USERS.items() if uid != ADMIN_ID}
+    
+    # Include all users, including the admin ID (Alice) for selection
+    user_options = {uid: u['username'] for uid, u in USERS.items()} 
     
     if user_options:
-        user_var.set(list(user_options.keys())[0]) # Set default
-        
-        # NOTE: ttk Combobox styling is complex in pure Tk, but we inherit colors where possible
+        # Set default to the current active user, or the first available user
+        if ACTIVE_USER_ID in user_options:
+             user_var.set(ACTIVE_USER_ID)
+        else:
+             user_var.set(list(user_options.keys())[0]) 
+
         user_menu = ttk.Combobox(switch_win, textvariable=user_var, values=list(user_options.keys()), state="readonly")
         user_menu.pack(pady=10)
         
@@ -516,48 +567,51 @@ def switch_user_gui():
         tk.Label(switch_win, text="No users available.", bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=20)
 
 def open_admin_console():
-    """Opens the admin panel for managing reports."""
+    """Opens the admin panel for managing reports and viewing raw content."""
     if ACTIVE_USER_ID != ADMIN_ID:
-        messagebox.showerror("Access Denied", "Only the Admin user can access this console.")
+        # Ensure the label uses the correct username for feedback
+        admin_username = get_username(ADMIN_ID)
+        messagebox.showerror("Access Denied", f"Only the Admin user (@{admin_username}) can access this console.")
         return
         
     if not root: return
 
     admin_win = tk.Toplevel(root)
     admin_win.title("Admin Console: Manage Reports & Flags")
-    admin_win.geometry("800x400")
+    admin_win.geometry("900x450") # Increased size for better raw content viewing
     admin_win.config(bg=POST_BG_COLOR)
     
     tk.Label(admin_win, text="Outstanding Reports & Flags", font=FONT_TITLE, bg=POST_BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
 
-    # Compile all reports (user-submitted) and flagged comments (auto-mod)
+    # --- Data Aggregation ---
     review_items = []
     
-    # 1. User Reports
+    # 1. Aggregate User Reports
+    reported_comment_ids = set()
     for report_id, report in REPORTS.items():
         comment = find_comment_by_id(report['post_id'], report['comment_id'])
         if comment:
             review_items.append({
                 'id': report_id,
                 'type': 'User Report',
-                'raw_content': comment.get('raw_content', comment['content']),
+                'raw_content': comment.get('raw_content', comment['content']), # Use raw_content
                 'reason': report['reason'],
                 'reporter': get_username(report['reporter_id']),
-                'comment_id': report['comment_id'],
+                'comment_id': comment['comment_id'],
                 'post_id': report['post_id'],
                 'mod_matches': comment.get('mod_matches', [])
             })
+            reported_comment_ids.add(comment['comment_id'])
             
-    # 2. Automated Flags (find flagged comments not already user-reported)
-    reported_comment_ids = {r['comment_id'] for r in REPORTS.values()}
+    # 2. Aggregate Automated Flags (that haven't been user-reported)
     for post in POSTS.values():
         for comment in post['comments']:
             if comment.get('is_flagged') and comment['comment_id'] not in reported_comment_ids:
                  review_items.append({
                     'id': f"AUTO-{comment['comment_id']}",
                     'type': 'Auto-Flag',
-                    'raw_content': comment.get('raw_content', comment['content']),
-                    'reason': f"Auto-detected {len(comment.get('mod_matches', []))} match(es).",
+                    'raw_content': comment.get('raw_content', comment['content']), # Use raw_content
+                    'reason': 'System Flag',
                     'reporter': 'System',
                     'comment_id': comment['comment_id'],
                     'post_id': post['post_id'],
@@ -569,47 +623,47 @@ def open_admin_console():
         tk.Label(admin_win, text="No outstanding items to review.", bg=POST_BG_COLOR, fg=SECONDARY_TEXT_COLOR, font=FONT_BOLD).pack(pady=50)
         return
 
-    # Use a Treeview for cleaner report display
+    # --- Treeview Setup ---
     style = ttk.Style()
     style.theme_use('default')
     style.configure("Treeview", background=POST_BG_COLOR, foreground=TEXT_COLOR, fieldbackground=POST_BG_COLOR)
     style.map('Treeview', background=[('selected', ACCENT_COLOR)])
     style.configure("Treeview.Heading", background=BG_COLOR, foreground=TEXT_COLOR)
 
-    tree = ttk.Treeview(admin_win, columns=('ID', 'Type', 'Comment', 'Reason', 'Matches'), show='headings')
-    tree.heading('ID', text='Item ID', anchor=tk.W)
+    tree = ttk.Treeview(admin_win, columns=('CommentID', 'Type', 'Comment', 'Reason', 'Matches'), show='headings')
+    tree.heading('CommentID', text='Comment ID', anchor=tk.W)
     tree.heading('Type', text='Type', anchor=tk.W)
-    tree.heading('Comment', text='Raw Content', anchor=tk.W)
+    tree.heading('Comment', text='RAW Content (Non-Redacted)', anchor=tk.W) # Title updated
     tree.heading('Reason', text='Reason/Reporter', anchor=tk.W)
     tree.heading('Matches', text='Mod Matches', anchor=tk.W)
-    tree.column('ID', width=120)
-    tree.column('Type', width=100)
-    tree.column('Comment', width=250)
+    tree.column('CommentID', width=120)
+    tree.column('Type', width=90)
+    tree.column('Comment', width=450) # Increased size for full raw content
     tree.column('Reason', width=150)
-    tree.column('Matches', width=100)
+    tree.column('Matches', width=80)
     tree.pack(fill="both", expand=True, padx=10)
 
     for item in review_items:
         match_details = f"{len(item['mod_matches'])} hits"
         
-        # Display the RAW content here for review
-        content_snippet = item['raw_content'][:40] + '...' if len(item['raw_content']) > 40 else item['raw_content']
+        # Display the FULL RAW content (Key change: displays non-redacted content)
+        content_display = item['raw_content'] 
         
         tree.insert('', tk.END, iid=item['comment_id'], values=(
-            item['id'], 
+            item['comment_id'], 
             item['type'], 
-            content_snippet, 
-            item['reason'] if item['type'] == 'User Report' else 'System Flag', 
+            content_display, 
+            item['reason'] if item['type'] == 'User Report' else 'System Flag',
             match_details
         ))
-        
+
+    # --- Admin Action Logic ---
     def handle_admin_action(action):
         selected_id = tree.focus()
         if not selected_id:
-            messagebox.showwarning("Selection Error", "Please select a report first.")
+            messagebox.showwarning("Selection Error", "Please select an item first.")
             return
 
-        # The selected_id is the comment_id
         selected_comment_id = selected_id 
         
         if action == 'delete':
@@ -617,13 +671,17 @@ def open_admin_console():
         elif action == 'resolve':
             admin_mark_report_resolved_logic(selected_comment_id)
 
-        admin_win.destroy() # Close and reopen admin window to refresh
-        open_admin_console()
-        refresh_feed_ui()
+        # For delete/resolve, refresh the feed and console
+        if action in ('delete', 'resolve'):
+            admin_win.destroy() 
+            open_admin_console()
+            refresh_feed_ui()
 
     # Admin Action Buttons
     button_frame = tk.Frame(admin_win, bg=POST_BG_COLOR)
     button_frame.pack(pady=10)
+    
+    # Removed "View Details" button
     
     tk.Button(button_frame, text="Delete Comment", bg=LIKE_COLOR_ACTIVE, fg=TEXT_COLOR, font=FONT_BOLD, 
                 command=lambda: handle_admin_action('delete')).pack(side=tk.LEFT, padx=5)
@@ -640,6 +698,7 @@ def admin_mark_report_resolved_logic(comment_id):
         for comment in post['comments']:
             if comment['comment_id'] == comment_id:
                 comment['is_flagged'] = False
+                comment['mod_matches'] = [] # Clear stored matches
                 break
     
     # 2. Remove all related reports from the global list
@@ -683,7 +742,7 @@ if __name__ == "__main__":
     init_data()
     
     # Setup initial demonstration data
-    pst_id_a = create_post_initial("usr-101", "Hello world! Starting my journey on this platform. This is a longer post to test scrolling and wrapping features. #firstpost")
+    pst_id_a = create_post_initial("adm-000", "Hello world! Starting my journey on this platform. This is a longer post to test scrolling and wrapping features. #firstpost")
     pst_id_b = create_post_initial("usr-102", "Reading a great book today. Any recommendations? Let me know in the comments below! 📚")
     # This post contains a hidden swear word to test post redaction
     pst_id_c = create_post_initial("usr-103", "Quick update: The coffee machine is finally fixed! I think that guy is a chutiya.") 
@@ -691,7 +750,7 @@ if __name__ == "__main__":
     # Pre-set some likes for demonstration
     POSTS[pst_id_a]['likes'].add("usr-102")
     POSTS[pst_id_a]['likes'].add("usr-103")
-    POSTS[pst_id_c]['likes'].add("usr-101")
+    POSTS[pst_id_c]['likes'].add("adm-000")
     
     # Normal comment
     add_comment_initial(pst_id_a, "usr-102", "Welcome! Nice content.")
@@ -700,7 +759,7 @@ if __name__ == "__main__":
     cmt_id_2 = add_comment_initial(pst_id_a, "usr-103", "This is spam and offensive, you are a lawde!") 
     
     # User-reported comment (should be auto-redacted and user-reported)
-    cmt_id_3 = add_comment_initial(pst_id_b, "usr-101", "Try 'The Martian'. Excellent read. You are a madrchod.") 
+    cmt_id_3 = add_comment_initial(pst_id_b, "adm-000", "Try 'The Martian'. Excellent read. You are a madrchod.") 
 
     # Add a report to cmt_id_3 (Bob reports Alice's comment)
     report_initial(pst_id_b, cmt_id_3, "usr-102", "Violates community guidelines: hate speech.")
